@@ -101,6 +101,8 @@ def make_gpu_parallel_steps(step_groups: List[Union[BashSteps, BashStep, str]]):
     p_steps = [
     'IFS="," read -r -a _GPUS<<< "$CUDA_VISIBLE_DEVICES"',
     '_TOTAL_GPUS=${#_GPUS[@]}',
+    # get hostname to differentiate locks per node
+    '_HOST=$(hostname)',
     ]
     for i, steps in enumerate(step_groups):
         if isinstance(steps, str) or isinstance(steps, BashStep):
@@ -110,13 +112,16 @@ def make_gpu_parallel_steps(step_groups: List[Union[BashSteps, BashStep, str]]):
         p_steps += [
             f'_NTH_GPU=$(({i} % $_TOTAL_GPUS))',
             '_GPU=${_GPUS[$_NTH_GPU]}',
-            'touch "_gpu_$_GPU.lock"',
+            'LOCK_FILE="_gpu_${_GPU}_${_HOST}.lock"',
+            'touch "$LOCK_FILE"',
+            #'touch "_gpu_$_GPU.lock"',
             '{',
             'export CUDA_VISIBLE_DEVICES=$_GPU',
             'flock 3',
-            f'echo "run steps group {i} on $_GPU, CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"',
+            f'echo "run steps group {i} on $_GPU ($_HOST), CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"',
             *steps,
-            '} 3<"_gpu_$_GPU.lock" &',
+            '} 3<"$LOCK_FILE" &',
+            #'} 3<"_gpu_$_GPU.lock" &',
         ]
     p_steps.append('wait')
     return p_steps
