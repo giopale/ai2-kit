@@ -190,6 +190,10 @@ async def cll_model_devi_selector(input: CllModelDeviSelectorInput, ctx: CllMode
         logger.info('selecting structures with PLUMED')
     
         plumed_options=input.config.plumed_options
+
+        for varname, config in plumed_options.variables.items():
+            logger.info(f'keeping structures with variable {varname} within {config.limits}')
+        
         candidates = executor.run_python_fn(bulk_select_structures_by_cv)(candidates=candidates,
                             plumed_options=plumed_options,
                             cv_config=plumed_options.variables,
