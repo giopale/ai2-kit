@@ -4,6 +4,8 @@ from ai2_kit.core.util import dump_json, dump_text, flush_stdio, limit
 from ai2_kit.core.pydantic import BaseModel
 
 from typing import List, Optional, Tuple, Dict
+from pydantic import Field
+
 from io import StringIO
 from dataclasses import dataclass
 import pandas as pd
@@ -13,16 +15,23 @@ from functools import lru_cache
 import traceback
 
 import ase.io
-import os
+import os, sys
 
 from .data import get_data_format, DataFormat, artifacts_to_ase_atoms
 from .iface import ICllSelectorOutput, BaseCllContext
 from .constant import DEFAULT_ASAP_SOAP_DESC, DEFAULT_ASAP_PCA_REDUCER
 
+import plumed
+import numpy as np 
+
 
 logger = get_logger(__name__)
 
 
+class VariableConfig(BaseModel):
+    cmd: str
+    limits: List[Optional[float]]
+    
 class CllModelDeviSelectorInputConfig(BaseModel):
 
     class AsapOptions(BaseModel):
@@ -38,6 +47,22 @@ class CllModelDeviSelectorInputConfig(BaseModel):
         descriptor: dict = {'soap': { **DEFAULT_ASAP_SOAP_DESC, 'preset': 'minimal'}}
         dim_reducer: dict = {'pca': DEFAULT_ASAP_PCA_REDUCER}
         cluster: dict = {'dbscan': {}}
+
+    class PlumedOptions(BaseModel):
+        disable: bool = False
+        plumed_logfile: str = 'plumed.log'
+        input_lines: str = Field(default='', alias='input')
+        variables: dict[str, VariableConfig] = Field(default_factory=dict)
+
+#        plumed_options:
+#            input: |
+#                targetO: GROUP ATOMS=262
+#                targetTi: GROUP ATOMS=378
+#                hydrogens: GROUP ATOMS=1-152
+#            variables:
+#                cn:
+#                    cmd: "COORDINATION GROUPA=targetO GROUPB=hydrogens R_0=1.2 MM=48 NN=24"
+#                    limits: [None,None]
 
     f_trust_lo: float = 0.
     """
@@ -67,6 +92,10 @@ class CllModelDeviSelectorInputConfig(BaseModel):
     workers: int = 4
     """
     number of workers to run the analysis
+    """
+    plumed_options: Optional[PlumedOptions] = None
+    """
+    options for ASAP to further select candidates
     """
 
 
@@ -153,6 +182,25 @@ async def cll_model_devi_selector(input: CllModelDeviSelectorInput, ctx: CllMode
     stats_report = tabulate(table, headers=headers, tablefmt='tsv')
     logger.info('stats report: \n%s\n', stats_report)
     executor.dump_text(stats_report, os.path.join(work_dir, 'stats.tsv'))
+    
+    remaining_struct= [atoms for _, atoms in artifacts_to_ase_atoms(candidates, type_map=input.type_map)]
+    logger.info(f'structures remaining after model_devi: {len(remaining_struct)}')
+
+    if input.config.plumed_options and not input.config.plumed_options.disable:
+        logger.info('selecting structures with PLUMED')
+    
+        plumed_options=input.config.plumed_options
+        candidates = executor.run_python_fn(bulk_select_structures_by_cv)(candidates=candidates,
+                            plumed_options=plumed_options,
+                            cv_config=plumed_options.variables,
+                            type_map=input.type_map,
+                            work_dir=work_dir,
+                            )
+        remaining_struct= [atoms for _, atoms in artifacts_to_ase_atoms(candidates, type_map=input.type_map)]
+        logger.info(f'structures remaining after PLUMED: {len(remaining_struct)}')
+        
+        
+
 
     # further select candidates by ASAP
     if input.config.asap_options and not input.config.asap_options.disable:
@@ -168,12 +216,203 @@ async def cll_model_devi_selector(input: CllModelDeviSelectorInput, ctx: CllMode
             sort_by_energy=asap_options.sort_by_ssw_energy,
             workers=input.config.workers,
         )
+        remaining_struct= [atoms for _, atoms in artifacts_to_ase_atoms(candidates, type_map=input.type_map)]
+        logger.info(f'structures remaining after ASAP: {len(remaining_struct)}')
 
     return CllModelDeviSelectorOutput(
         candidates=[Artifact.of(**a) for a in candidates],
         new_explore_systems=[Artifact.of(**a) for a in new_systems],
         passing_rate=total_good / total,
     )
+
+def bulk_select_structures_by_cv(candidates: List[ArtifactDict],
+                                    plumed_options,
+                                    cv_config,
+                                    type_map: List[str],
+                                    work_dir: str,
+                                    limit_per_cluster: int = -1,
+                                    workers: int = 4,
+                                    ) -> List[ArtifactDict]:
+    try:
+        dump_json(candidates, os.path.join(work_dir, 'candidates.debug.json'))
+    except Exception as e:
+        pass
+    get_ancestor = lambda c: c['attrs']['ancestor']
+    candidates = sorted(candidates, key=get_ancestor)
+    inputs = []
+    for i, (ancestor_key, candidate_group) in enumerate(groupby(candidates, key=get_ancestor)):
+        candidate_group = list(candidate_group)
+        inputs.append((candidate_group, candidate_group[0]['attrs']))
+
+    import joblib
+    return joblib.Parallel(n_jobs=workers,)(
+        joblib.delayed(select_structures_by_cv)(
+            candidates=group,
+            attrs=attrs,
+            plumed_options=plumed_options,
+            cv_config=cv_config,
+            type_map=type_map,
+            work_dir=os.path.join(work_dir, 'asap', f'{i:06}'),
+        ) for i, (group, attrs) in enumerate(inputs)
+    )  # type: ignore
+
+
+def select_structures_by_cv(candidates: List[ArtifactDict],
+                                plumed_options,
+                                cv_config,
+                                attrs: dict,
+                                type_map: List[str],
+                                work_dir: str,
+                                limit_per_cluster: int = -1,
+                                ):
+
+    
+    def create_plumed_var( p, name, command ):
+        p.cmd("readInputLine", name + ": " + command )
+        shape = np.zeros( 1, dtype=np.int_ )
+        p.cmd("getDataRank " + name, shape )
+        data = np.zeros((1))
+        p.cmd("setMemoryForData " + name, data )
+        return data
+
+    os.makedirs(work_dir, exist_ok=True)
+
+    atoms_list = [atoms for _, atoms in artifacts_to_ase_atoms(candidates, type_map=type_map)]
+
+    if len(atoms_list) >  0:
+        logger.info(f'number of candidates: {len(atoms_list)}')
+        
+         
+        # Create arrays for stuff
+        num_frames=len(atoms_list)
+        num_atoms=len(atoms_list[0].positions)
+        virial=np.zeros((3,3),dtype=np.float64)
+        masses=np.ones(num_atoms,dtype=np.float64)
+        forces=np.random.rand(num_atoms,3)
+        charges=np.zeros(num_atoms,dtype=np.float64)
+
+        # Create PLUMED object and read input
+        p = plumed.Plumed()
+        p.cmd("setMDEngine","python")
+        p.cmd("setTimestep", 1.)
+        p.cmd("setKbT", 1.)
+        p.cmd("setNatoms",num_atoms)
+        p.cmd("setLogFile",plumed_options.plumed_logfile)
+        p.cmd("init")
+
+        for line in plumed_options.input_lines.split('\n'):
+            print(line)
+            p.cmd("readInputLine",line)
+
+        plumed_var_results={}
+        plumed_results={}
+        for varname, config in cv_config.items():
+            data = create_plumed_var(p,varname, config.cmd)
+            plumed_var_results.update({varname:data})
+            plumed_results.update({varname:np.zeros(num_frames)})
+        logger.info(f'PLUMED setup completed, see logs: {plumed_options.plumed_logfile}')
+        # Now analyze the trajectory
+        for step in range(0,num_frames) :
+            p.cmd("setStep",step )
+            p.cmd("setBox",atoms_list[step].get_cell().array)
+            p.cmd("setMasses", masses )
+            p.cmd("setCharges", charges )
+            p.cmd("setPositions", atoms_list[step].positions)
+            p.cmd("setForces", forces )
+            p.cmd("setVirial", virial )
+            p.cmd("calc")
+            
+            for varname in cv_config.keys():
+                plumed_results[varname][step]=plumed_var_results[varname]
+            
+        logger.info('PLUMED completed')
+        selected_atoms_list = []
+        mask = np.ones(num_frames, dtype=bool)
+        for varname, config in cv_config.items():
+            logger.info(f'filtering variable {varname} between {config.limits}')
+            low=config.limits[0]
+            high=config.limits[1]
+            if low is not None:
+                mask &= (plumed_results[varname] >= low)
+            if high is not None:
+                mask &= (plumed_results[varname] <= high)
+
+        selected_atoms_list = [ item for item, m in zip(atoms_list, mask) if m]
+
+    else:
+        selected_atoms_list = atoms_list
+    logger.info(f'candidates remaining: {len(selected_atoms_list)}')
+
+    # write selected structures to file
+    structures_file = os.path.join(work_dir,  'structures_cv.xyz')
+    ase.io.write(structures_file, selected_atoms_list, format='extxyz')
+
+    logger.info(f'file saved: {structures_file}')
+
+    output = {
+        'url': structures_file,
+        'format': DataFormat.EXTXYZ,
+        'attrs': attrs,
+    }
+    dump_json(output, os.path.join(work_dir, 'output.debug.json'))
+    flush_stdio()  # flush joblib stdio buffer
+    return output
+        
+
+
+
+
+    if len(atoms_list) < 20:
+        # FIXME: there are a lot of potential issue when the number of atoms is small
+        # the root cause is in asaplib, which I guess has not been tested with small dataset
+        selected_atoms_list = atoms_list
+    elif limit_per_cluster <= 0:
+        selected_atoms_list = atoms_list
+    else:
+        if sort_by_energy and 'ssw_energy' in atoms_list[0].info:
+            atoms_list = sorted(atoms_list, key=lambda atoms: atoms.info['ssw_energy'])
+
+        # use asaplib to group structures
+        # load structures to ASAP
+        tmp_structures_file = os.path.join(work_dir, '.tmp-structures.xyz')
+        ase.io.write(tmp_structures_file, atoms_list, format='extxyz')
+        asapxyz = ASAPXYZ(tmp_structures_file)
+
+        # group structures
+        try:
+            asap_path_prefix = os.path.join(work_dir, 'asap')
+            descriptors, _ = get_descriptor(asapxyz, descriptor_opt, path_prefix=asap_path_prefix)
+            reduced_descriptors = reduce_dimension(descriptors, dim_reducer_opt)
+            trainer = get_trainer(reduced_descriptors, cluster_opt)
+            cluster_labels = get_cluster(asapxyz, reduced_descriptors, trainer, path_prefix=asap_path_prefix)
+
+            # dump_json(cluster_labels, os.path.join(work_dir, 'cluster.debug.json'))
+            selected_frames = []
+            for frames in cluster_labels.values():
+                if len(frames) < limit_per_cluster:
+                    selected_frames += list(frames)
+                else:
+                    selected_frames += list(frames[:limit_per_cluster])
+            selected_atoms_list = [atoms_list[i] for i in selected_frames]
+        except Exception as e:
+            print('asaplib failed: %s', e)
+            # dump exception to file
+            dump_text(traceback.format_exc(), os.path.join(work_dir, 'asaplib-exception.txt'))
+            selected_atoms_list = atoms_list
+
+    # write selected structures to file
+    distinct_structures_file = os.path.join(work_dir,  'distinct_structures.xyz')
+    ase.io.write(distinct_structures_file, selected_atoms_list, format='extxyz')
+
+    output = {
+        'url': distinct_structures_file,
+        'format': DataFormat.EXTXYZ,
+        'attrs': attrs,
+    }
+    dump_json(output, os.path.join(work_dir, 'output.debug.json'))
+    flush_stdio()  # flush joblib stdio buffer
+    return output
+
 
 
 def bulk_select_structures_by_model_devi(model_devi_outputs: List[ArtifactDict],
@@ -201,6 +440,9 @@ def bulk_select_structures_by_model_devi(model_devi_outputs: List[ArtifactDict],
         )
         for i, output in enumerate(model_devi_outputs)
     )  # type: ignore
+
+
+
 
 
 def select_structures_by_model_devi(model_devi_output: ArtifactDict,
@@ -441,3 +683,6 @@ def select_distinct_structures(candidates: List[ArtifactDict],
     dump_json(output, os.path.join(work_dir, 'output.debug.json'))
     flush_stdio()  # flush joblib stdio buffer
     return output
+
+
+
